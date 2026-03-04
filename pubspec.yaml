@@ -1,0 +1,13 @@
+name: verify_google_purchase
+version: 1.0.0
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  dart_appwrite: ^14.0.0
+  googleapis_auth: ^1.6.0
+  http: ^1.2.0
+
+dev_dependencies:
+  lints: ^2.0.0
