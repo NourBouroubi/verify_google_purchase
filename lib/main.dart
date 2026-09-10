@@ -44,6 +44,14 @@ Client _adminClient() {
     ..setKey(apiKey!);
 }
 
+/// Where the catalogue lives, so a sale's price comes from the book itself.
+final String storeBooksCol =
+    Platform.environment['STORE_BOOKS_COLLECTION'] ?? 'store_books_table';
+
+/// The sales ledger.
+final String transactionsCol =
+    Platform.environment['TRANSACTIONS_COLLECTION'] ?? 'transactions_table';
+
 Future<dynamic> main(final context) async {
   // Validate environment
   final envVars = [
@@ -386,6 +394,67 @@ Future<void> _grantBookToLibrary(
   );
 
   context.log('✅ Book added. New total: ${normalizedBookIds.length}');
+
+  await _recordSale(
+    context,
+    adminDatabases: adminDatabases,
+    userId: userId,
+    bookId: bookId,
+  );
+}
+
+/// Writes the sale to transactions_table.
+///
+/// Called only after Google has verified the purchase and only when the book
+/// was actually new to the library, so a repeated verification of the same
+/// purchase cannot double-count it.
+///
+/// The price is read from the book itself rather than taken from the client,
+/// which could claim anything. A free book records nothing: it is not a sale,
+/// and letting it into the ledger is what made every free download look like
+/// revenue.
+///
+/// Failure here is logged and swallowed. The reader has paid and has their
+/// book; losing one bookkeeping row must never undo that.
+Future<void> _recordSale(
+  final context, {
+  required Databases adminDatabases,
+  required String userId,
+  required String bookId,
+}) async {
+  try {
+    final book = await adminDatabases.getDocument(
+      databaseId: dbId!,
+      collectionId: storeBooksCol,
+      documentId: bookId,
+    );
+
+    final rawPrice = book.data['price'];
+    final price = rawPrice is num
+        ? rawPrice.toInt()
+        : int.tryParse('${rawPrice ?? ''}') ?? 0;
+
+    if (price <= 0) {
+      context.log('ℹ️ Free book — nothing to record as a sale.');
+      return;
+    }
+
+    await adminDatabases.createDocument(
+      databaseId: dbId!,
+      collectionId: transactionsCol,
+      documentId: ID.unique(),
+      data: <String, dynamic>{
+        'user_id': userId,
+        'book_id': bookId,
+        'total_price': price,
+        'status': 'completed',
+      },
+    );
+
+    context.log('💰 Sale recorded: $bookId for $price');
+  } catch (e) {
+    context.error('⚠️ Could not record the sale (the book was still granted): $e');
+  }
 }
 
 /// Handle RTDN (Real-Time Developer Notification) from Google Pub/Sub
