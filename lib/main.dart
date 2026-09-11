@@ -445,7 +445,10 @@ Future<void> _recordSale(
       documentId: ID.unique(),
       data: <String, dynamic>{
         'user_id': userId,
-        'book_id': bookId,
+        // A relationship attribute, so it takes a list of ids. Passing the
+        // bare id is refused with relationship_value_invalid, which is what
+        // kept every sale out of the ledger.
+        'book_id': <String>[bookId],
         'total_price': price,
         'status': 'completed',
       },
