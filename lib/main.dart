@@ -98,6 +98,11 @@ Future<dynamic> main(final context) async {
     final libraryIds = _parseStringList(data['library_ids']);
     final jwt = (data['jwt'] ?? '').toString().trim();
 
+    // Present when this purchase is paying for a gift. Only the id crosses
+    // the wire: who receives the book, and what it costs, are read back out
+    // of the gift document, which the buyer's device cannot write.
+    final giftId = (data['gift_id'] ?? '').toString().trim();
+
     if (purchaseToken.isEmpty || productId.isEmpty || bookId.isEmpty) {
       context.error('❌ Missing required fields');
       return context.res.json({
@@ -181,7 +186,8 @@ Future<dynamic> main(final context) async {
 
     // Step 2: Verify the book exists in the store
     final adminDatabases = Databases(_adminClient());
-    context.log('📖 Looking up book: dbId=$dbId, collection=$storeCol, bookId=$bookId');
+    context.log(
+        '📖 Looking up book: dbId=$dbId, collection=$storeCol, bookId=$bookId');
     try {
       final bookDoc = await adminDatabases.getDocument(
         databaseId: dbId!,
@@ -199,7 +205,47 @@ Future<dynamic> main(final context) async {
       context.log('⚠️ Proceeding to grant book despite lookup failure');
     }
 
-    // Step 3: Grant book to user's library
+    // Step 3: Deliver what was bought.
+    //
+    // A gift goes to its recipient rather than to the buyer, and is settled
+    // against its own document -- which is also where the price is checked,
+    // since a Play product is a tier rather than an amount and a cheap tier
+    // must not be able to pay for an expensive book.
+    if (giftId.isNotEmpty) {
+      final outcome = await _settleGift(
+        context,
+        adminDatabases: adminDatabases,
+        giftId: giftId,
+        payerId: userId,
+        productId: productId,
+      );
+
+      if (outcome != null) {
+        // Refused before anything was delivered. The purchase is left
+        // unacknowledged on Google's side so it can be refunded or retried
+        // rather than silently consumed.
+        return context.res.json({
+          'success': false,
+          'error': outcome,
+        }, 403);
+      }
+
+      if (isGoogleVerified) {
+        await _acknowledgePurchase(
+          context,
+          purchaseToken: purchaseToken,
+          productId: productId,
+        );
+      }
+
+      return context.res.json({
+        'success': true,
+        'message': 'Gift paid for and delivered',
+        'google_verified': isGoogleVerified,
+        'gift_id': giftId,
+      });
+    }
+
     await _grantBookToLibrary(
       context,
       adminDatabases: adminDatabases,
@@ -236,6 +282,170 @@ Future<dynamic> main(final context) async {
       'error': 'Internal server error',
     }, 500);
   }
+}
+
+/// Marks a paid gift as delivered, the same way the Chargily webhook does.
+///
+/// Returns `null` when the gift was settled (including when it already had
+/// been, since a retried verification must not fail), or a short reason to
+/// refuse with.
+///
+/// Deliberately does not put the book in anybody's library: the recipient
+/// unwraps the card and `claim_gift` moves it then, so the moment the book
+/// appears is the moment they opened the gift.
+Future<String?> _settleGift(
+  final context, {
+  required Databases adminDatabases,
+  required String giftId,
+  required String payerId,
+  required String productId,
+}) async {
+  final giftsCol = Platform.environment['DB_GIFTS'] ?? 'gifts';
+  final notifyFunctionId = Platform.environment['NOTIFY_FUNCTION_ID'] ?? '';
+
+  Document gift;
+  try {
+    gift = await adminDatabases.getDocument(
+      databaseId: dbId!,
+      collectionId: giftsCol,
+      documentId: giftId,
+    );
+  } on AppwriteException catch (e) {
+    context.error('❌ Gift $giftId not found: ${e.message}');
+    return 'gift_not_found';
+  }
+
+  final status = gift.data['status']?.toString() ?? '';
+  if (status != 'pending_payment') {
+    // Verification runs again after an app restart with a pending purchase,
+    // so arriving at an already-delivered gift is ordinary, not an error.
+    context.log('ℹ️ Gift $giftId is already $status; nothing to settle');
+    return null;
+  }
+
+  final senderId = gift.data['sender_id']?.toString() ?? '';
+  if (senderId != payerId) {
+    context.error('❌ Gift $giftId belongs to $senderId, not to $payerId');
+    return 'not_your_gift';
+  }
+
+  // A Play product is a price tier, not an amount, so the check is that the
+  // tier bought is the tier this book is sold at. Without it, the cheapest
+  // product could pay for the most expensive book.
+  //
+  // A book may carry its own product id, which overrides the tier its price
+  // would otherwise fall into, so both are accepted -- and the book's own id
+  // is read here rather than taken from the request.
+  final accepted = <String>{};
+  final tier = _productIdForPrice((gift.data['price'] as num?)?.toInt() ?? 0);
+  if (tier != null) accepted.add(tier);
+
+  try {
+    final book = await adminDatabases.getDocument(
+      databaseId: dbId!,
+      collectionId: storeCol!,
+      documentId: gift.data['book_id']?.toString() ?? '',
+    );
+    final own = book.data['google_play_product_id']?.toString() ?? '';
+    if (own.isNotEmpty) accepted.add(own);
+  } catch (e) {
+    context.log('⚠️ Could not read the gifted book for its product id: $e');
+  }
+
+  if (accepted.isNotEmpty && !accepted.contains(productId)) {
+    context.error(
+        '❌ Gift $giftId expects one of $accepted but $productId was bought');
+    await adminDatabases.updateDocument(
+      databaseId: dbId!,
+      collectionId: giftsCol,
+      documentId: giftId,
+      data: {'status': 'underpaid'},
+    );
+    return 'wrong_price_tier';
+  }
+
+  // --- Bind the recipient if they already have an account ---
+  String? recipientId = gift.data['recipient_id']?.toString();
+  if (recipientId == null || recipientId.isEmpty) {
+    final email =
+        (gift.data['recipient_email']?.toString() ?? '').toLowerCase();
+    try {
+      final match = await Users(_adminClient()).list(
+        queries: [Query.equal('email', email), Query.limit(1)],
+      );
+      if (match.users.isNotEmpty) recipientId = match.users.first.$id;
+    } catch (e) {
+      context.log('⚠️ Recipient lookup failed for $email: $e');
+    }
+  }
+
+  await adminDatabases.updateDocument(
+    databaseId: dbId!,
+    collectionId: giftsCol,
+    documentId: giftId,
+    data: {
+      'status': 'delivered',
+      'recipient_id': recipientId,
+      'delivered_at': DateTime.now().toUtc().toIso8601String(),
+    },
+    permissions: [
+      if (senderId.isNotEmpty) Permission.read(Role.user(senderId)),
+      if (recipientId != null && recipientId.isNotEmpty)
+        Permission.read(Role.user(recipientId)),
+    ],
+  );
+
+  context.log('🎁 Gift $giftId delivered');
+
+  // A gift is a sale like any other, and it is recorded against whoever paid
+  // for it. Without this the ledger would show gift revenue as nothing at
+  // all, because the gift path never reaches _grantBookToLibrary.
+  await _recordSale(
+    context,
+    adminDatabases: adminDatabases,
+    userId: senderId,
+    bookId: gift.data['book_id']?.toString() ?? '',
+  );
+
+  if (notifyFunctionId.isNotEmpty &&
+      recipientId != null &&
+      recipientId.isNotEmpty) {
+    try {
+      await Functions(_adminClient()).createExecution(
+        functionId: notifyFunctionId,
+        xasync: true,
+        body: jsonEncode({
+          'user_id': recipientId,
+          'title': 'وصلتك هدية',
+          'body': '${gift.data['sender_name'] ?? ''} أهداك كتاب '
+              '${gift.data['book_title'] ?? ''}',
+          'data': {'type': 'gift_received', 'gift_token': giftId},
+        }),
+      );
+    } catch (e) {
+      // The gift is delivered whether or not the push went out.
+      context.error('⚠️ Could not notify recipient $recipientId: $e');
+    }
+  }
+
+  return null;
+}
+
+/// The Play product a DZD price belongs to.
+///
+/// Must stay in step with `AppConfig.getGooglePlayProductId` in the app. It
+/// is duplicated rather than shared because the two run in different places,
+/// and the server cannot take the client's word for which tier applies --
+/// that is the whole point of checking it here.
+String? _productIdForPrice(int priceDZD) {
+  if (priceDZD <= 0) return null;
+  if (priceDZD <= 300) return 'book_tier_1';
+  if (priceDZD <= 600) return 'book_tier_2';
+  if (priceDZD <= 1000) return 'book_tier_3';
+  if (priceDZD <= 1500) return 'book_tier_4';
+  if (priceDZD <= 2000) return 'book_tier_5';
+  if (priceDZD <= 3000) return 'book_tier_6';
+  return 'book_tier_7';
 }
 
 /// Verify a purchase token with Google Play Developer API
