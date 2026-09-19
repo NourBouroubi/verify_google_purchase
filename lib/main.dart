@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:dart_appwrite/dart_appwrite.dart';
+import 'package:http/http.dart' as http;
 import 'package:dart_appwrite/models.dart' show Document;
 import 'package:googleapis_auth/auth_io.dart' as auth;
 
@@ -406,6 +407,19 @@ Future<String?> _settleGift(
     userId: senderId,
     bookId: gift.data['book_id']?.toString() ?? '',
   );
+
+  // One channel each: a push for an account, an email for somebody who does
+  // not have one yet and could not otherwise be reached.
+  if (recipientId == null || recipientId.isEmpty) {
+    await _emailGiftLink(
+      context,
+      toEmail: (gift.data['recipient_email']?.toString() ?? '').toLowerCase(),
+      recipientName: gift.data['recipient_name']?.toString() ?? '',
+      senderName: gift.data['sender_name']?.toString() ?? '',
+      bookTitle: gift.data['book_title']?.toString() ?? '',
+      token: giftId,
+    );
+  }
 
   if (notifyFunctionId.isNotEmpty &&
       recipientId != null &&
@@ -830,3 +844,106 @@ List<String> _parseStringList(dynamic value) {
   }
   return [];
 }
+
+/// Emails the recipient their gift link.
+///
+/// Only for somebody who has no account yet. A recipient who already has one
+/// gets a push and finds the gift waiting in the app; sending both would be
+/// noise. It is also the case that actually needs an email -- there is no
+/// other way to reach a person who has never heard of the app.
+///
+/// Deliberately does NOT include the sender's written note. That is read
+/// when the box is opened, not in an inbox preview, and putting it here
+/// would spend the one thing the card exists for.
+///
+/// Every failure is swallowed. The gift is paid for and delivered either
+/// way, and the link still reaches them through whoever sent it.
+Future<void> _emailGiftLink(
+  final context, {
+  required String toEmail,
+  required String recipientName,
+  required String senderName,
+  required String bookTitle,
+  required String token,
+}) async {
+  final apiKey = Platform.environment['BREVO_API_KEY'] ?? '';
+  if (apiKey.isEmpty || toEmail.isEmpty) return;
+
+  final fromEmail =
+      Platform.environment['GIFT_FROM_EMAIL'] ?? 'noreply@ah-mar.app';
+  final fromName = Platform.environment['GIFT_FROM_NAME'] ?? 'أحمر';
+  final linkBase =
+      Platform.environment['GIFT_LINK_BASE'] ?? 'https://link.ah-mar.app/g/';
+  final link = '$linkBase$token';
+
+  final greeting = recipientName.trim().isEmpty
+      ? 'مرحباً'
+      : 'مرحباً ${_escapeHtml(recipientName.trim())}';
+  final from = senderName.trim().isEmpty
+      ? 'أحدهم'
+      : _escapeHtml(senderName.trim());
+  final title = _escapeHtml(bookTitle.trim());
+
+  final html = '''
+<div dir="rtl" style="font-family:system-ui,-apple-system,'Segoe UI',Arial,sans-serif;background:#f4f6f8;padding:28px 12px;">
+  <div style="max-width:480px;margin:0 auto;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 2px 14px rgba(0,0,0,.08);">
+    <div style="background:linear-gradient(135deg,#E0332C,#8E1B16);padding:34px 24px;text-align:center;">
+      <div style="font-size:46px;line-height:1;">&#127873;</div>
+      <div style="color:#ffffff;font-size:21px;font-weight:700;margin-top:12px;">وصلتك هدية</div>
+    </div>
+    <div style="padding:26px 24px;color:#25303d;font-size:16px;line-height:1.85;">
+      <p style="margin:0 0 14px;">$greeting،</p>
+      <p style="margin:0 0 14px;"><strong>$from</strong> أهداك كتاب <strong>$title</strong> على تطبيق أحمر.</p>
+      <p style="margin:0 0 24px;color:#5b6876;font-size:15px;">وترك لك رسالة تقرأها حين تفتح الهدية.</p>
+      <a href="$link" style="display:block;text-align:center;background:#E0332C;color:#ffffff;text-decoration:none;font-weight:700;font-size:16px;padding:15px;border-radius:12px;">افتح هديتك</a>
+      <p style="margin:22px 0 0;color:#8a95a1;font-size:13px;line-height:1.7;">
+        أو انسخ هذا الرابط إلى متصفّحك:<br>
+        <span style="color:#5b6876;word-break:break-all;">$link</span>
+      </p>
+    </div>
+  </div>
+  <p style="max-width:480px;margin:16px auto 0;color:#97a1ad;font-size:12px;text-align:center;line-height:1.7;">
+    وصلتك هذه الرسالة لأن أحدهم أهداك كتاباً على هذا البريد.
+  </p>
+</div>
+''';
+
+  try {
+    final response = await http.post(
+      Uri.parse('https://api.brevo.com/v3/smtp/email'),
+      headers: {
+        'api-key': apiKey,
+        'content-type': 'application/json',
+        'accept': 'application/json',
+      },
+      body: jsonEncode({
+        'sender': {'name': fromName, 'email': fromEmail},
+        'to': [
+          {
+            'email': toEmail,
+            if (recipientName.trim().isNotEmpty) 'name': recipientName.trim(),
+          }
+        ],
+        'subject': 'وصلتك هدية: $bookTitle',
+        'htmlContent': html,
+      }),
+    );
+
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      context.log('Gift email sent to $toEmail');
+    } else {
+      context.error(
+          'Gift email refused (${response.statusCode}): ${response.body}');
+    }
+  } catch (e) {
+    context.error('Could not email the gift link to $toEmail: $e');
+  }
+}
+
+/// The book title and the two names go straight into HTML, and a stray
+/// angle bracket in a display name would otherwise break the layout.
+String _escapeHtml(String value) => value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('\"', '&quot;');
